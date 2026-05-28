@@ -15,14 +15,27 @@ def tikhub_get(path, params):
     url = TIKHUB_BASE + path + "?" + qs
     tk = get_token()
     hdr = "Authorization: Bearer " + tk
-    cmd = ["curl", "-s", "--proxy", "http://127.0.0.1:7890", url, "-H", hdr]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        return {"error": "curl exit=" + str(r.returncode)}
-    try:
-        return json.loads(r.stdout)
-    except Exception as e:
-        return {"error": "JSON: " + str(e)[:100]}
+    
+    def _do_request(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            try:
+                return json.loads(r.stdout)
+            except:
+                return None
+        return None
+    
+    # Try without proxy first (Codex sandbox, direct network)
+    direct = _do_request(["curl", "-s", "--max-time", "15", url, "-H", hdr])
+    if direct is not None:
+        return direct
+    
+    # Fall back to proxy
+    proxy_req = _do_request(["curl", "-s", "--max-time", "15", "--proxy", "http://127.0.0.1:7890", url, "-H", hdr])
+    if proxy_req is not None:
+        return proxy_req
+    
+    return {"error": "curl failed (tried direct + proxy)"}
 
 def lark(args):
     r = subprocess.run(["lark-cli"] + args, capture_output=True, text=True, timeout=30)
@@ -80,35 +93,51 @@ def transcribe(music_url, aweme_id):
     if not groq_key:
         return None, "无Groq API Key"
     
-    ensure_tmp()
+    # Download audio - try direct first, fall back to proxy
     audio_path = os.path.join(_TMP_AUDIO_DIR, aweme_id + ".mp3")
-    
-    # Download audio
-    dl = subprocess.run(["curl", "-s", "--proxy", "http://127.0.0.1:7890", "-o", audio_path, music_url],
-                        timeout=60)
-    if dl.returncode != 0 or not os.path.exists(audio_path):
+    dl_cmds = [
+        ["curl", "-s", "--max-time", "30", "-o", audio_path, music_url],
+        ["curl", "-s", "--max-time", "30", "--proxy", "http://127.0.0.1:7890", "-o", audio_path, music_url],
+    ]
+    dl_ok = False
+    for dl_cmd in dl_cmds:
+        dl = subprocess.run(dl_cmd, timeout=60)
+        if dl.returncode == 0 and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            dl_ok = True
+            break
+    if not dl_ok:
         return None, "下载音频失败"
     
     try:
-        # Check file size
-        size = os.path.getsize(audio_path)
-        if size < 1000:
-            return None, "音频文件过小"
-        
-        # Send to Groq Whisper
-        cmd = [
-            "curl", "-s", "--proxy", "http://127.0.0.1:7890",
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            "-H", "Authorization: Bearer " + groq_key,
-            "-F", "file=@" + audio_path,
-            "-F", "model=whisper-large-v3",
-            "-F", "language=zh",
+        # Send to Groq Whisper - try direct first, fall back to proxy
+        whisper_cmds = [
+            ["curl", "-s", "--max-time", "180",
+             "https://api.groq.com/openai/v1/audio/transcriptions",
+             "-H", "Authorization: Bearer " + groq_key,
+             "-F", "file=@" + audio_path,
+             "-F", "model=whisper-large-v3",
+             "-F", "language=zh"],
+            ["curl", "-s", "--max-time", "180", "--proxy", "http://127.0.0.1:7890",
+             "https://api.groq.com/openai/v1/audio/transcriptions",
+             "-H", "Authorization: Bearer " + groq_key,
+             "-F", "file=@" + audio_path,
+             "-F", "model=whisper-large-v3",
+             "-F", "language=zh"],
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        result = json.loads(r.stdout)
-        text = result.get("text", "")
-        if text.strip():
-            return text.strip(), None
+        text = None
+        for wcmd in whisper_cmds:
+            r = subprocess.run(wcmd, capture_output=True, text=True, timeout=180)
+            if r.returncode == 0:
+                try:
+                    result = json.loads(r.stdout)
+                    t = result.get("text", "")
+                    if t.strip():
+                        text = t.strip()
+                        break
+                except:
+                    pass
+        if text:
+            return text, None
         return None, "ASR返回空文本"
     except Exception as e:
         return None, "ASR失败: " + str(e)[:100]
